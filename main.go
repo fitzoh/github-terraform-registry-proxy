@@ -27,15 +27,20 @@ const listModuleVersionsEndpoint = "/{namespace}/{name}/{provider}/versions"
 //sample URL: http://localhost:8080/terraform-aws-modules/vpc/aws/v2.44.0/download
 const downloadModuleVersionEndpoint = "/{namespace}/{name}/{provider}/{version}/download"
 
+//Returns the actual content of module
+//We need to proxy to it to enable authenticated access
+const downloadModuleVersionForRealEndpoint = "/{namespace}/{name}/{provider}/{version}/download-for-real"
+
 func main() {
 	r := mux.NewRouter()
 
 	r.HandleFunc(terraformWellKnownEndpoint, terraformWellKnownHandler)
-	r.HandleFunc(listModuleVersionsEndpoint, ListModuleVersionsHandler)
-	r.HandleFunc(downloadModuleVersionEndpoint, DownloadModuleHandler)
+	r.HandleFunc(listModuleVersionsEndpoint, listModuleVersionsHandler)
+	r.HandleFunc(downloadModuleVersionEndpoint, downloadModuleHandler)
+	r.HandleFunc(downloadModuleVersionForRealEndpoint, downloadModuleForRealHandler)
 
 	r.Use(loggingMiddleware)
-	log.Fatal(http.ListenAndServe(":8080", r))
+	log.Fatal(http.ListenAndServeTLS(":8080", "127.0.0.1.pem", "127.0.0.1-key.pem", r))
 }
 
 //Log the request URI and move along
@@ -53,7 +58,7 @@ func terraformWellKnownHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, `{"modules.v1":"/"}`)
 }
 
-//Gross JSON structs used by ListModuleVersionsHandler
+//Gross JSON structs used by listModuleVersionsHandler
 type modules struct {
 	Modules []versions `json:"modules"`
 }
@@ -66,7 +71,7 @@ type version struct {
 
 //Lists the versions available for a given module
 //see https://www.terraform.io/docs/internals/module-registry-protocol.html#list-available-versions-for-a-specific-module
-func ListModuleVersionsHandler(w http.ResponseWriter, r *http.Request) {
+func listModuleVersionsHandler(w http.ResponseWriter, r *http.Request) {
 	gh := clientForRequest(r)
 	vars := mux.Vars(r)
 
@@ -106,8 +111,16 @@ func tagToVersion(tag *github.RepositoryTag) version {
 	return version{Version: name}
 }
 
-//Returns the URL to download the source code of a specific module version
-func DownloadModuleHandler(w http.ResponseWriter, r *http.Request) {
+//Returns the proxy URL to download the module
+func downloadModuleHandler(w http.ResponseWriter, r *http.Request) {
+	final := r.URL.String() + "-for-real?archive=tar.gz"
+	fmt.Println(final)
+	w.Header().Add("X-Terraform-Get", final)
+	w.WriteHeader(204)
+}
+
+//Finds the tarball URL for the given module tag and proxies an authenticated request for it to the github API
+func downloadModuleForRealHandler(w http.ResponseWriter, r *http.Request) {
 	gh := clientForRequest(r)
 	vars := mux.Vars(r)
 
@@ -129,8 +142,10 @@ func DownloadModuleHandler(w http.ResponseWriter, r *http.Request) {
 	for _, tag := range tags {
 		//Terraform strips the leading `v` for semver tags
 		if tag.GetName() == version || tag.GetName() == "v"+version {
-			w.Header().Add("X-Terraform-Get", tag.GetTarballURL()+"?archive=tar.gz")
-			w.WriteHeader(204)
+
+			fmt.Println("proxying", tag.GetTarballURL())
+			downloadReq, _ := http.NewRequest("GET", tag.GetTarballURL(), nil)
+			gh.Do(context.Background(), downloadReq, w)
 			return
 		}
 	}
