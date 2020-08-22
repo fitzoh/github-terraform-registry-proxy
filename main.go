@@ -6,12 +6,11 @@ import (
 	"fmt"
 	"github.com/google/go-github/github"
 	"github.com/gorilla/mux"
+	"golang.org/x/oauth2"
 	"log"
 	"net/http"
 	"strings"
 )
-
-var gh *github.Client
 
 //Required service discovery endpoint
 //see https://www.terraform.io/docs/internals/module-registry-protocol.html#service-discovery
@@ -29,7 +28,6 @@ const listModuleVersionsEndpoint = "/{namespace}/{name}/{provider}/versions"
 const downloadModuleVersionEndpoint = "/{namespace}/{name}/{provider}/{version}/download"
 
 func main() {
-	gh = github.NewClient(nil)
 	r := mux.NewRouter()
 
 	r.HandleFunc(terraformWellKnownEndpoint, terraformWellKnownHandler)
@@ -69,6 +67,7 @@ type version struct {
 //Lists the versions available for a given module
 //see https://www.terraform.io/docs/internals/module-registry-protocol.html#list-available-versions-for-a-specific-module
 func ListModuleVersionsHandler(w http.ResponseWriter, r *http.Request) {
+	gh := clientForRequest(r)
 	vars := mux.Vars(r)
 
 	namespace := vars["namespace"]
@@ -109,6 +108,7 @@ func tagToVersion(tag *github.RepositoryTag) version {
 
 //Returns the URL to download the source code of a specific module version
 func DownloadModuleHandler(w http.ResponseWriter, r *http.Request) {
+	gh := clientForRequest(r)
 	vars := mux.Vars(r)
 
 	namespace := vars["namespace"]
@@ -136,4 +136,21 @@ func DownloadModuleHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(404)
 
+}
+
+var unauthenticatedGithubClient = github.NewClient(nil)
+
+//Checks if the incoming request contains an access token.
+//If it does, return a github client that uses that token.
+//Otherwise, return an unauthenticated github client.
+func clientForRequest(r *http.Request) *github.Client {
+	auth := r.Header.Get("Authorization")
+	token := strings.TrimPrefix(auth, "Bearer ")
+	if token == "" {
+		return unauthenticatedGithubClient
+	}
+	ctx := context.Background()
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
+	client := oauth2.NewClient(ctx, ts)
+	return github.NewClient(client)
 }
