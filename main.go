@@ -8,36 +8,66 @@ import (
 	"github.com/gorilla/mux"
 	"log"
 	"net/http"
+	"strings"
 )
 
 var gh *github.Client
+
+//Required service discovery endpoint
+//see https://www.terraform.io/docs/internals/module-registry-protocol.html#service-discovery
+const terraformWellKnownEndpoint = "/.well-known/terraform.json"
+
+//Lists the versions available for a given module
+//see https://www.terraform.io/docs/internals/module-registry-protocol.html#list-available-versions-for-a-specific-module
+//sample URL: http://localhost:8080/terraform-aws-modules/vpc/aws/versions
+const listModuleVersionsEndpoint = "/{namespace}/{name}/{provider}/versions"
+
+//Returns the URL to download the source code of a specific module version
+//see https://www.terraform.io/docs/internals/module-registry-protocol.html#download-source-code-for-a-specific-module-version
+//but I'm pretty sure those docs are wrong, so also see https://github.com/hashicorp/terraform/pull/25964
+//sample URL: http://localhost:8080/terraform-aws-modules/vpc/aws/v2.44.0/download
+const downloadModuleVersionEndpoint = "/{namespace}/{name}/{provider}/{version}/download"
 
 func main() {
 	gh = github.NewClient(nil)
 	r := mux.NewRouter()
 
-	r.HandleFunc("/.well-known/terraform.json", TerraformWellKnownHandler)
-	//http://localhost:8080/terraform-aws-modules/vpc/aws/versions
-	r.HandleFunc("/{namespace}/{name}/{provider}/versions", ListModuleVersionsHandler)
-	//http://localhost:8080/terraform-aws-modules/vpc/aws/ignored/v2.44.0/download
-	r.HandleFunc("/{namespace}/{name}/{provider}/{system}/{version}/download", DownloadModuleHandler)
+	r.HandleFunc(terraformWellKnownEndpoint, terraformWellKnownHandler)
+	r.HandleFunc(listModuleVersionsEndpoint, ListModuleVersionsHandler)
+	r.HandleFunc(downloadModuleVersionEndpoint, DownloadModuleHandler)
 
+	r.Use(loggingMiddleware)
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
 
-func TerraformWellKnownHandler(w http.ResponseWriter, r *http.Request) {
+//Log the request URI and move along
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Println(r.Method, r.URL)
+		next.ServeHTTP(w, r)
+	})
+}
+
+//Returns the terraform service discovery payload.
+//Currently only the modules API is supported
+func terraformWellKnownHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Content-Type", "application/json")
 	fmt.Fprint(w, `{"modules.v1":"/"}`)
 }
 
-type ModulesJson struct {
-	Modules []VersionsJson `json:"modules"`
+//Gross JSON structs used by ListModuleVersionsHandler
+type modules struct {
+	Modules []versions `json:"modules"`
+}
+type versions struct {
+	Versions []version `json:"versions"`
+}
+type version struct {
+	Version string `json:"version"`
 }
 
-type VersionsJson struct {
-	Version map[string]string `json:"versions"`
-}
-
+//Lists the versions available for a given module
+//see https://www.terraform.io/docs/internals/module-registry-protocol.html#list-available-versions-for-a-specific-module
 func ListModuleVersionsHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 
@@ -55,28 +85,35 @@ func ListModuleVersionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var versions []VersionsJson
+	var vs []version
 	for _, tag := range tags {
-		fmt.Println(tag.GetTarballURL())
-		fmt.Println(tag.GetZipballURL())
-		versions = append(versions, VersionsJson{
-			Version: map[string]string{"version": tag.GetName()},
-		})
+		vs = append(vs, tagToVersion(tag))
 	}
 
-	json.NewEncoder(w).Encode(ModulesJson{
-		Modules: versions,
-	})
+	response := modules{
+		Modules: []versions{
+			{Versions: vs},
+		},
+	}
+	json.NewEncoder(w).Encode(response)
 }
 
+//Simple helper function to map from the github API to terraform structs
+func tagToVersion(tag *github.RepositoryTag) version {
+	name := tag.GetName()
+	if strings.HasPrefix(name, "v") {
+		name = name[1:]
+	}
+	return version{Version: name}
+}
+
+//Returns the URL to download the source code of a specific module version
 func DownloadModuleHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 
 	namespace := vars["namespace"]
 	name := vars["name"]
 	provider := vars["provider"]
-	//system is ignored ¯\_(ツ)_/¯
-	//system := vars["system"]
 	version := vars["version"]
 
 	owner := namespace
@@ -90,15 +127,13 @@ func DownloadModuleHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, tag := range tags {
-		if tag.GetName() == version {
-			fmt.Println(tag.GetTarballURL())
-			w.Header().Add("X-Terraform-Get", tag.GetTarballURL())
+		//Terraform strips the leading `v` for semver tags
+		if tag.GetName() == version || tag.GetName() == "v"+version {
+			w.Header().Add("X-Terraform-Get", tag.GetTarballURL()+"?archive=tar.gz")
 			w.WriteHeader(204)
-
 			return
 		}
 	}
-	fmt.Fprint(w, "not found")
 	w.WriteHeader(404)
 
 }
